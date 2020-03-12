@@ -12,7 +12,16 @@ set_property(TARGET craft PROPERTY C_STANDARD 99)
 target_link_libraries(craft PUBLIC sds)
 target_include_directories(craft PUBLIC "${PROJECT_SOURCE_DIR}/thirdparty/sds")
 
-add_executable(testmain tests/testmain.cpp)
+add_executable(basicsimulator tests/basicsimulator.cpp tests/simulator.cpp)
+target_link_libraries(basicsimulator PUBLIC craft)
+target_link_libraries(basicsimulator PUBLIC gflags)
+target_link_libraries(basicsimulator PUBLIC simple_logger)
+target_include_directories(basicsimulator PUBLIC 
+    "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/thirdparty/simple_logger/src"
+    )
+
+add_executable(testmain tests/testmain.cpp tests/simulator.cpp)
 target_link_libraries(testmain PUBLIC craft)
 target_link_libraries(testmain PUBLIC gflags)
 target_link_libraries(testmain PUBLIC simple_logger)

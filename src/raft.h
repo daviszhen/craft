@@ -331,7 +331,7 @@ typedef struct _raft{
 Entry* getNewEntry(int);
 
 /**
- * 删除Entry，释放空间
+ * 删除Entry内部数据。不删除Entry本身。
  */
 void deleteEntry(Entry*);
 

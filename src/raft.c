@@ -8,10 +8,11 @@ Entry* getNewEntry(int count){
 }
 
 void deleteEntry(Entry* p){
-    if(p->data!=NULL){
-        raftFree(p->data);
+    if(p->data != NULL){
+        sdsfree(p->data);
+        p->data = NULL;
+        p->dataLen = 0;
     }
-    raftFree(p);
 }
 
 int getEntrySpaceLength(const Entry* p){
@@ -498,14 +499,14 @@ void applyLog(Raft* raftPtr){
             Entry e = logAt(raftPtr->log,raftPtr->lastApplied);
             if(e.type == NO_OP){
                 if(e.data == NULL){
-                    raftLog(RAFT_DEBUG,"apply no_op index %d term %d cmd is null",e.index,e.term);
+                    raftLog(RAFT_DEBUG,"raft %lu apply no_op index %d term %d cmd is null",raftPtr->nodeId,e.index,e.term);
                 }else{
-                    raftLog(RAFT_DEBUG,"apply no_op index %d term %d cmd %s",e.index,e.term,e.data);
+                    raftLog(RAFT_DEBUG,"raft %lu apply no_op index %d term %d cmd %s",raftPtr->nodeId,e.index,e.term,e.data);
                 }
             }else if(e.type == CONFIG){
-                raftLog(RAFT_DEBUG,"apply config index %d term %d cmd %s",e.index,e.term,e.data);
+                raftLog(RAFT_DEBUG,"raft %lu apply config index %d term %d cmd %s",raftPtr->nodeId,e.index,e.term,e.data);
             }else{
-                raftLog(RAFT_DEBUG,"apply data index %d term %d",e.index,e.term);
+                raftLog(RAFT_DEBUG,"raft %lu apply data index %d term %d",raftPtr->nodeId,e.index,e.term);
             }
         }
         
@@ -525,6 +526,7 @@ int isLeaderCommittedEntriesInCurrentTerm(Raft* raftPtr){
 
 void raftCore(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
+    raftLog(RAFT_DEBUG,"raft %lu electTimeout %d timegone %d",raftPtr->nodeId,raftPtr->electionTimeout,raftPtr->timeGone);
     if(Leader == raftPtr->role){
         //发送hearbeat给peers
         if(raftPtr->timeGone >= raftPtr->heartbeatTimeout){
