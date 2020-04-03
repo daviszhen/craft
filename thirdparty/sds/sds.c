@@ -41,6 +41,10 @@
 
 const char *SDS_NOINIT = "SDS_NOINIT";
 
+void *(*s_malloc) (size_t) = malloc;
+void *(*s_realloc) (void *, size_t) = realloc;
+void (*s_free) (void *) = free;
+
 static inline int sdsHdrSize(char type) {
     switch(type&SDS_TYPE_MASK) {
         case SDS_TYPE_5:

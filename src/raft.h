@@ -15,10 +15,11 @@ extern "C"
 
 #define raftAssert(expr) assert((expr))
 
-#define raftMalloc malloc
-#define raftCalloc calloc
-#define raftRealloc realloc
-#define raftFree free
+//内存分配函数
+extern void *(*raftMalloc) (size_t);
+extern void *(*raftCalloc) (size_t, size_t);
+extern void *(*raftRealloc) (void *, size_t);
+extern void (*raftFree) (void *);
 
 //Raft 三种状态
 enum Role{
@@ -32,11 +33,35 @@ enum Role{
 #endif
 
 //==========================Raft日志相关================================
+/**
+ * 节点状态：在线且无投票权，在线且有投票权，下线，
+ * 
+ * 状态转化
+ * 
+ * 新增节点：在线且无投票权
+ * 
+ * 在线且无投票权 -> 在线且有投票权
+ */
+
+/*节点投票*/
+#define RAFT_NODE_VOTED                 (1  <<  0)
+/*节点有投票权*/
+#define RAFT_NODE_CAN_VOTE              (1  <<  1)
+/*节点在线*/
+#define RAFT_NODE_ACTIVE                (1  <<  2)
+/*节点的投票权，已经COMMITTED*/
+#define RAFT_NODE_CAN_VOTE_COMMITTED    (1  <<  3)
+/*节点添加，已经COMMITTED*/
+#define RAFT_NODE_ADD_COMMITTED    (1  <<  4)
 
 enum EntryType{
     NO_OP,
     DATA,
-    CONFIG
+    LOAD_CONFIG,
+    ADD_NODE,
+    ENABLE_VOTE,
+    DISABLE_VOTE,
+    REMOVE_NODE
 };
 
 typedef struct
@@ -187,6 +212,19 @@ typedef int(*sendAppendEntriesRequestInterface)(RaftInterfaceType,RaftNodeInterf
 typedef int(*sendAddRemoveServerRequestInterface)(RaftInterfaceType,uint64_t,UserDataInterfaceType,const AddRemoveServerRequest*);
 
 /**
+ * 日志事件钩子函数接口
+ * 返回0 - 成功
+ */
+typedef int(*logEventHookInterface)(RaftInterfaceType,UserDataInterfaceType,Entry*);
+
+/**
+ * 日志事件钩子函数扩展接口
+ * 带上了一个扩展参数
+ * 返回0 - 成功
+ */
+typedef int(*logEventHookExtendInterface)(RaftInterfaceType,UserDataInterfaceType,Entry*,UserDataInterfaceType);
+
+/**
  * 发送AddRemoveServer响应的函数接口
  */
 typedef void(*sendAddRemoveServerResponseInterface)(RaftInterfaceType,UserDataInterfaceType,const AddRemoveServerResponse*);
@@ -228,6 +266,16 @@ typedef int(*addRemoveServerStringToUserDataInterface)(const sds*,int,UserDataIn
  */
 typedef void(*raftUserDataToStringInterface)(const UserDataInterfaceType,sds*);
 
+/**
+ * Raft实例转为Leader的回调函数
+ */
+typedef void(*onConversionToLeaderHookInterface)(const RaftInterfaceType);
+
+/**
+ * 持久化Raft实例状态的回调函数
+ */
+typedef void(*persistStateHookInteface)(const RaftInterfaceType);
+
 //Raft实例对外通信接口
 typedef struct{
     sendRequestVoteRequestInterface sendRequestVoteRequest;
@@ -239,6 +287,15 @@ typedef struct{
     addRemoveServerUserDataToStringInterface addRemoveServerUserDataToString;
     addRemoveServerStringToUserDataInterface addRemoveServerStringToUserData;
     raftUserDataToStringInterface raftUserDataToString;
+    logEventHookInterface addingEntry;//向日志添加Entry时的钩子函数
+    logEventHookInterface deletingEntryAtEnd;//从日志尾部删除Entry时的钩子函数
+    logEventHookInterface deletingEntryAtBegin;//从日志头部删除Entry时的钩子函数
+    logEventHookInterface applyEntry;//应用Entry到状态机的钩子函数
+    logEventHookExtendInterface getConfigEntryNodeId;//获取配置中机器的noideId的钩子函数
+    logEventHookExtendInterface membershipChangeEvent;//增加或删除RaftNode的钩子函数
+    onConversionToLeaderHookInterface onConversionToLeaderBefore;//在Raft实例即将转为Leader前的钩子函数
+    onConversionToLeaderHookInterface onConversionToLeaderAfter;//在Raft实例刚转为Leader后的钩子函数
+    persistStateHookInteface persistState;//持久化Raft实例状态的钩子函数
 }Interface;
 
 //参与raft协议的机器
@@ -252,6 +309,11 @@ typedef struct _raftnode
     uint64_t nodeId;
     //与机器有关的其它信息
     void* userData;
+    
+    //在选举时，是否投票 1-投票 0-不投票
+    int isVote;
+    //节点状态
+    int status;
 
     //对外接口
     Interface interfaces;
@@ -270,9 +332,6 @@ typedef struct _raft{
 
     //状态
     int role;
-
-    //已经获得的投票数
-    int voteMeCount;
 
     //定时器超时时间
     int electionTimeoutBegin;
@@ -336,9 +395,27 @@ Entry* getNewEntry(int);
 void deleteEntry(Entry*);
 
 /**
+ * Entry深度复制
+ */
+void copyEntryTo(const Entry*,Entry*);
+
+/**
  *获取Entry的存储空间大小。包括内部数据长度 
  */
 int getEntrySpaceLength(const Entry*);
+
+/**
+ * 是否是投票权配置变更Entery
+ * 返回 1 是，返回 0 否
+ */
+int isVoteRightConfigChangeEntry(const int);
+
+/**
+ * 是否是配置变更Entery
+ * 包括投票权配置变更
+ * 返回 1 是，返回 0 否
+ */
+int isConfigChangeEntry(const int);
 
 /**
  * 如果有必要，两倍扩展Entry存储空间.
@@ -417,12 +494,12 @@ int logCountFromBegin(const Log*,int);
 /**
  * 删除尾部N个元素
  */
-void logDeleteAtEnd(Log*,int);
+void logDeleteAtEnd(Raft*,int);
 
 /**
  * 删除头部N个元素
  */
-void logDeleteAtBegin(Log*,int);
+void logDeleteAtBegin(Raft*,int);
 
 /**
  * 最新一条配置Entry的index
@@ -478,6 +555,36 @@ int getRaftTime(const Raft*);
 void setRaftInterface(Raft*,Interface*,UserDataInterfaceType);
 
 /**
+ * 设置投票votedFor
+ */
+void setRaftVotedFor(Raft*,uint64_t);
+
+/**
+ * 获得votedFor
+ */
+uint64_t getRaftVotedFor(const Raft*);
+
+/**
+ * 设置currentTerm
+ */
+void setRaftCurrentTerm(Raft*,int);
+
+/**
+ * 获得currentTerm
+ */
+int getRaftCurrentTerm(const Raft*);
+
+/**
+ * 设置commitIndex
+ */
+void setRaftCommitIndex(Raft*,int);
+
+/**
+ * 获得commitIndex
+ */
+int getRaftCommitIndex(const Raft*);
+
+/**
  * Raft切换角色
  * 切换到Follower
  */
@@ -506,9 +613,19 @@ int isLeader(const Raft*);
 int getMajorityVote(const Raft*);
 
 /**
+ * 获取majority的个数
+ */
+int getMajority(const Raft*);
+
+/**
  * 数量是否超过majority
  */
 int beyondMajority(int,const Raft*);
+
+/**
+ * 获取能投票的节点个数
+ */
+int getCountOfRaftNodeActiveAndCanVote(const Raft*);
 
 /**
  * 此raft实例的日志是否更新
@@ -520,7 +637,12 @@ int myLogIsNewer(const Log*,const RequestVoteRequest*);
  * 
  * apply日志到状态机器
  */
-void applyLog(Raft*);
+void applyLog(Raft*,int);
+
+/**
+ * 默认应用日志到状态机函数
+ */
+int defaultApplyLog(RaftInterfaceType,UserDataInterfaceType,Entry*);
 
 /**
  * 判断Entry的index是否被committed
@@ -586,6 +708,66 @@ void getRaftNodeConfigString(RaftNode*,sds*);
  */
 void resetRaftNodeIndex(RaftNode*,int,int);
 
+/**
+ * 设置节点投票
+ * 
+ */
+void raftNodeSetVote(RaftNode*,int);
+
+/**
+ * 复位投票
+ * 1-投票，0-不投票
+ */
+void resetRaftNodeVote(RaftNode*,int);
+
+/**
+ * 节点有投票吗
+ */
+int raftNodeHasVoted(RaftNode*);
+
+/**
+ * 设置节点投票权
+ */
+void raftNodeSetCanVote(RaftNode*,int);
+
+/**
+ * 节点有投票权吗
+ */
+int raftNodeHasCanVote(RaftNode*);
+
+/**
+ * 设置节点在线
+ */
+void raftNodeSetActive(RaftNode*,int);
+
+/**
+ * 节点在线吗
+ * 
+ */
+int raftNodeHasActive(RaftNode*);
+
+/**
+ * 设置节点投票已committed
+ * 
+ */
+void raftNodeSetCanVoteCommitted(RaftNode*,int);
+
+/**
+ * 节点投票权已committed
+ * 
+ */
+int raftNodeHasCanVoteCommitted(RaftNode*);
+
+/**
+ * 设置节点添加已committed
+ */
+void raftNodeSetAddCommitted(RaftNode*,int);
+
+/**
+ * 节点添加已committed
+ */
+int raftNodeHasAddCommitted(RaftNode*);
+
 void showRaftNode(const RaftNode*);
 
 /**
@@ -599,6 +781,13 @@ uint64_t getRaftNodeId(const Raft*);
  * 如果是此Raft实例所在的机器。设置selfNode.
  */
 RaftNode* addRaftNodeIntoConfig(Raft*,uint64_t,void*,int);
+
+/**
+ * 向Raft协议中添加机器(nodeId,ip,port,userData)。但此机器无投票权。
+ * 如果已经有此机器，返回NULL.
+ * 如果是此Raft实例所在的机器。设置selfNode.
+ */
+RaftNode* addRaftNodeIntoConfigWithoutCanVote(Raft*,uint64_t,void*,int);
 
 /**
  * 从Raft的配置中删除机器
@@ -710,6 +899,14 @@ int submitDataToRaft(Raft* raftPtr,sds data,int dataLen,enum EntryType type,int*
 int addServer(Raft*,uint64_t,UserDataInterfaceType);
 
 /**
+ * 向Raft实例所在集群添加新机器(nodeId和其它信息)。本接口是给管理员调用的。
+ * 管理员直接调用在Raft实例上，而不是通过通讯媒介到达Raft实例的。
+ * 调用者会被阻塞，直到得到答复才能返回。
+ * 返回0 - 成功
+ */
+int addServerRPC(RaftInterfaceType,uint64_t,UserDataInterfaceType);
+
+/**
  * 向机器(ip和port)发送AddRemoveServer请求,将所在机器加入到机器(ip和port)所在集群中（或从中删除）。但是不发给自己。
  * 返回0 - 成功
  */
@@ -737,6 +934,10 @@ int min(int,int);
 #define RAFT_VERBOSE 1
 #define RAFT_NOTICE 2
 #define RAFT_WARNING 3
+
+//raft日志级别
+extern int raftLogLevel;
+
 //输出日志
 void raftLog(int level,const char* fmt,...);
 //终止程序

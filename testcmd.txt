@@ -1,0 +1,18 @@
+sudo gdb  --args  build/basicsimulator --nodeCount=3 --testTime=40 --msgDropRate=50 --msgDuplicateRate=80 --msgDelayRate=80 --partitionRate=80 --rebootRate=2
+sudo gdb  --args  build/basicsimulator --nodeCount=3 --testTime=40 --msgDropRate=90 --msgDuplicateRate=90 --msgDelayRate=90  --rebootRate=2
+sudo gdb  --args  build/basicsimulator --nodeCount=3 --testTime=40 --rebootRate=2
+sudo gdb  --args  build/basicsimulator --nodeCount=3 --testTime=40 --rebootRate=2
+sudo gdb  --args  build/basicsimulator --nodeCount=3 --testTime=40 --rebootRate=2 --enableCheckLiveness=false
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=90 --msgDuplicateRate=90 --msgDelayRate=90
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=60
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=60 --partitionRate=60
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=60 --partitionRate=60 --memberChangeRate=3
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=80 --partitionRate=60 --memberChangeRate=3
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=70 --partitionRate=60 --memberChangeRate=3
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=80 --partitionRate=60 --memberChangeRate=3
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=75 --partitionRate=60 --memberChangeRate=3
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=70 --partitionRate=60 --memberChangeRate=3
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=70 --partitionRate=60 --memberChangeRate=10
+sudo gdb  --args  build/basicsimulator --nodeCount=5 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=70 --partitionRate=60 --memberChangeRate=30
+sudo gdb  --args  build/basicsimulator --nodeCount=3 --testTime=40 --rebootRate=3 --enableCheckLiveness=false   --msgDropRate=60 --msgDuplicateRate=60 --msgDelayRate=70 --partitionRate=60 --memberChangeRate=30

@@ -3,3 +3,4 @@
 *.a
 build/
 .vscode
+store*

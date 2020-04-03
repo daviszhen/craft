@@ -37,6 +37,6 @@
  * the include of your alternate allocator if needed (not needed in order
  * to use the default libc allocator). */
 
-#define s_malloc malloc
-#define s_realloc realloc
-#define s_free free
+extern void *(*s_malloc) (size_t);
+extern void *(*s_realloc) (void *, size_t);
+extern void (*s_free) (void *);

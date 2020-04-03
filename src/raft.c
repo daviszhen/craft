@@ -1,5 +1,12 @@
 #include "raft.h"
 
+void *(*raftMalloc) (size_t) = malloc;
+void *(*raftCalloc) (size_t, size_t) = calloc;
+void *(*raftRealloc) (void *, size_t) = realloc;
+void (*raftFree) (void *) = free;
+
+int raftLogLevel = RAFT_WARNING;
+
 //===================================================
 Entry* getNewEntry(int count){
     Entry* p = raftCalloc(count,sizeof(Entry));
@@ -15,9 +22,31 @@ void deleteEntry(Entry* p){
     }
 }
 
+void copyEntryTo(const Entry* src,Entry* dst){
+    raftAssert(src!=NULL);
+    raftAssert(dst!=NULL);
+    *dst = *src;
+    if(src->data != NULL){
+        dst->data = sdsdup(src->data);
+        raftAssert(dst->data != NULL);
+    }
+    
+}
+
 int getEntrySpaceLength(const Entry* p){
     raftAssert(p!=NULL);
     return sizeof(Entry) + p->dataLen;
+}
+
+int isVoteRightConfigChangeEntry(const int type){
+    return type == ENABLE_VOTE || type == DISABLE_VOTE;
+}
+
+int isConfigChangeEntry(const int type){
+    return type == ADD_NODE ||
+        type == ENABLE_VOTE ||
+        type == DISABLE_VOTE ||
+        type == REMOVE_NODE;
 }
 
 void expand(Log* logPtr){
@@ -29,6 +58,10 @@ void expand(Log* logPtr){
     logPtr->entries = raftRealloc(logPtr->entries,sizeof(Entry) * logPtr->capacity * 2);
     raftAssert(logPtr->entries !=  NULL);
     logPtr->capacity *= 2;
+    for(int i=logPtr->size;i<logPtr->capacity;++i){
+        logPtr->entries[i].data = NULL;
+        logPtr->entries[i].dataLen = 0;
+    }
 }
 
 Log* getNewLog(){
@@ -43,7 +76,7 @@ Log* getNewLog(){
     ptr->lastIncludedTerm = -1;
     ptr->size = 1;
     ptr->entries[0].data = sdsempty();
-    ptr->entries[0].dataLen = 0;
+    ptr->entries[0].dataLen = sdslen(ptr->entries[0].data);
     ptr->entries[0].index = 0;
     ptr->entries[0].term = 0;
     ptr->entries[0].type = NO_OP;
@@ -56,9 +89,7 @@ void deleteLog(Log* logPtr){
     raftAssert(logPtr != NULL);
     //释放有的数据
     for(int i=0;i<logPtr->capacity;i++){
-        if(logPtr->entries[i].data != NULL){
-            sdsfree(logPtr->entries[i].data);
-        }
+        deleteEntry(logPtr->entries+i);
     }
     raftFree(logPtr->entries);
     raftFree(logPtr);
@@ -111,14 +142,81 @@ int logAppend(Raft* raftPtr,Entry e){
     raftAssert(logPtr != NULL);
     raftAssert(e.data != NULL);
     expand(logPtr);
-    logPtr->entries[logPtr->size++] = e;
+    if(logPtr->size>0){
+        raftAssert(e.index >= logPtr->entries[logPtr->size - 1].index);
+        raftAssert(e.term >= logPtr->entries[logPtr->size - 1].term);
+    }
+    logPtr->entries[logPtr->size] = e;
+    if(raftPtr->interfaces.addingEntry){
+        int ret = raftPtr->interfaces.addingEntry(raftPtr,raftPtr->userData,&logPtr->entries[logPtr->size]);
+        raftAssert(ret==0);
+    }
+    logPtr->size++;
     logPtr->back = logPtr->size - 1;
+    //将数据复制一份
+    logPtr->entries[logPtr->size - 1].data = sdsdup(e.data);
     if(e.type == NO_OP){
         logPtr->lastNoopEntryIndex = logPtr->size - 1;
-    }else if(e.type == CONFIG){
+    }else if(e.type == LOAD_CONFIG){
         logPtr->lastConfigEntryIndex = logPtr->size - 1;
         loadConfigFromString(raftPtr,e.data,e.dataLen);
+    }else if(isConfigChangeEntry(logPtr->entries[logPtr->size - 1].type)){
+        logPtr->lastConfigEntryIndex = logPtr->size - 1;
+        //TODO:获取配置中机器的nodeId
+        raftAssert(raftPtr->interfaces.getConfigEntryNodeId != NULL);
+        uint64_t nodeId;
+        raftPtr->interfaces.getConfigEntryNodeId(raftPtr,raftPtr->userData,&logPtr->entries[logPtr->size - 1],&nodeId);
+        raftAssert(nodeId!=-1);
+        RaftNode * node = getRaftNodeFromConfig(raftPtr,nodeId);
+        int myself = (nodeId == raftPtr->nodeId);
+        switch (logPtr->entries[logPtr->size - 1].type)
+        {
+        case ADD_NODE:
+            {
+//               if(!myself){
+                    if(!node){
+                        node = addRaftNodeIntoConfigWithoutCanVote(raftPtr,nodeId,NULL,myself);
+                    }
+                    raftAssert(node != NULL);
+                    if(!raftNodeHasActive(node)){
+                        raftNodeSetActive(node,1);
+                    }
+//                }
+                /*
+                else if(!raftNodeHasActive(raftPtr->selfNode)){
+                    //TODO:让自己的RaftNode在线?
+                    raftNodeSetActive(raftPtr->selfNode,1);
+                }
+                */
+            }
+            break;
+        case ENABLE_VOTE:
+            {
+                node = addRaftNodeIntoConfig(raftPtr,nodeId,NULL,myself);
+                raftAssert(node != NULL);
+                raftAssert(raftNodeHasCanVote(node) != 0);
+            }
+            break;
+        case DISABLE_VOTE:
+            {
+                if(node != NULL && raftNodeHasCanVote(node)){
+                    raftNodeSetCanVote(node,0);
+                }
+            }
+            break;
+        case REMOVE_NODE:
+            {
+                if(node != NULL){
+                    raftNodeSetActive(node,0);
+                }
+            }
+            break;
+        default:
+            raftAssert(0);
+            break;
+        }
     }
+    raftAssert(e.index == logPtr->size - 1);
     return logPtr->size - 1;
 }
 
@@ -135,7 +233,9 @@ int logAppendData(Raft* raftPtr,sds data,int dataLen,enum EntryType type){
     e.term = raftPtr->currentTerm;
     e.type = type;
     e.index = logLength(raftPtr->log);
-    return logAppend(raftPtr,e);
+    int ret = logAppend(raftPtr,e);
+    raftAssert(ret == e.index);
+    return ret;
 }
 
 int logApppendNoop(Raft* raftPtr){
@@ -152,18 +252,83 @@ int logCountFromBegin(const Log* logPtr,int i){
     return i - logPtr->lastIncludedIndex;
 }
 
-void logDeleteAtEnd(Log* logPtr,int N){
+void logDeleteAtEnd(Raft* raftPtr,int N){
+    raftAssert(raftPtr != NULL);
+    Log* logPtr = raftPtr->log;
     raftAssert(logPtr != NULL);
     if(N > logPtr->size){
         raftLog(RAFT_WARNING,"the count of entries is not enough");
     }
+    /**
+     * Leader不会覆盖或删除其日志中的entry。只追加新entry。
+     * Leader Append-Only:a leader never overwrites or deletes entries in its log;
+     * it only appends new entries. §5.3
+     */
+    raftAssert(!isLeader(raftPtr));
     int count = min(logPtr->size,N);
-    logPtr->size -= count;
-    logPtr->back = logPtr->size - 1;
-    
+    for(int i=0;i<count;++i){
+        if(raftPtr->interfaces.deletingEntryAtEnd){
+            int ret = raftPtr->interfaces.deletingEntryAtEnd(raftPtr,raftPtr->userData,logPtr->entries+logPtr->size-1);
+            raftAssert(ret == 0);
+        }
+        if(isConfigChangeEntry(logPtr->entries[logPtr->size - 1].type)){
+            //逆向处理配置中的机器
+            //TODO:获取配置中机器的nodeId
+            raftAssert(raftPtr->interfaces.getConfigEntryNodeId != NULL);
+            uint64_t nodeId;
+            raftPtr->interfaces.getConfigEntryNodeId(raftPtr,raftPtr->userData,&logPtr->entries[logPtr->size - 1],&nodeId);
+            raftAssert(nodeId!=-1);
+            RaftNode * node = getRaftNodeFromConfig(raftPtr,nodeId);
+            switch (logPtr->entries[logPtr->size - 1].type)
+            {
+            case ADD_NODE:
+                {
+                    if(node != NULL){
+                        removeRaftNodeFromConfig(raftPtr,nodeId);
+                        if(nodeId == raftPtr->nodeId){
+                            raftAssert(0);
+                        }
+                    }
+                }
+                break;
+            case ENABLE_VOTE:
+                {
+                    raftNodeSetCanVote(node,0);
+                }
+                break;
+            case DISABLE_VOTE:
+                {
+                    raftNodeSetCanVote(node,1);
+                }
+                break;
+            case REMOVE_NODE:
+                {
+                    raftNodeSetActive(node,1);
+                }
+                break;
+            default:
+                raftAssert(0);
+                break;
+            }
+        }
+        if(logPtr->entries[logPtr->size - 1].index == getLastConfigEntryIndex(raftPtr->log)){
+            //TODO:更新值
+            raftPtr->log->lastConfigEntryIndex = -1;
+        }
+
+        if(logPtr->entries[logPtr->size - 1].index == getLastNoopEntryIndex(raftPtr->log)){
+            //TODO:更新值
+            raftPtr->log->lastNoopEntryIndex = -1;
+        }
+
+        logPtr->size--;
+        logPtr->back = logPtr->size - 1;
+    }    
 }
 
-void logDeleteAtBegin(Log* logPtr,int N){
+void logDeleteAtBegin(Raft* raftPtr,int N){
+    raftAssert(raftPtr!=NULL);
+    Log * logPtr =  raftPtr->log;
     raftAssert(logPtr != NULL);
     if(N > logPtr->size){
         raftLog(RAFT_WARNING,"the count of entries is not enough 2");
@@ -171,12 +336,25 @@ void logDeleteAtBegin(Log* logPtr,int N){
     int count = min(logPtr->size,N);
     //entry前移动
     if(count == logPtr->size){
+        for(int i=0;i<count;i++){
+            if(raftPtr->interfaces.deletingEntryAtBegin){
+                int ret = raftPtr->interfaces.deletingEntryAtBegin(raftPtr,raftPtr->userData,logPtr->entries+i);
+                raftAssert(ret == 0);
+                deleteEntry(logPtr->entries+i);
+            }
+        }
         logPtr->size = 0;
-        logPtr->back = logPtr->size - 1;
-        
+        logPtr->back = logPtr->size - 1;        
     }else{
         for(int i=0,j=count;j<logPtr->size;++i,++j){
+            if(raftPtr->interfaces.deletingEntryAtBegin){
+                int ret = raftPtr->interfaces.deletingEntryAtBegin(raftPtr,raftPtr->userData,logPtr->entries+i);
+                raftAssert(ret == 0);
+                deleteEntry(logPtr->entries+i);
+            }
             logPtr->entries[i] = logPtr->entries[j];
+            logPtr->entries[j].data = NULL;
+            logPtr->entries[j].dataLen = 0;
         }
         logPtr->size -= count;
         logPtr->back -= logPtr->size - 1;
@@ -218,7 +396,7 @@ int isNodeInConfig(Raft* raftPtr,uint64_t nodeId){
 
 sds makeConfigStringWith(Raft* raftPtr,uint64_t nodeId,UserDataInterfaceType userData){
     raftAssert(raftPtr!=NULL); 
-    raftAssert(userData!=NULL);
+    //raftAssert(userData!=NULL);
     sds str = sdsempty();
     for(int i=0;i<raftPtr->nodeCount;++i){
         sds nodeStr = sdsempty();
@@ -228,7 +406,7 @@ sds makeConfigStringWith(Raft* raftPtr,uint64_t nodeId,UserDataInterfaceType use
     }
     //加上参数中的机器
     str = sdscatfmt(str,"%U ",nodeId);
-    if(raftPtr->interfaces.raftNodeUserDataToString){
+    if(raftPtr->interfaces.raftNodeUserDataToString && userData){
         sds userDataString = sdsempty();
         raftPtr->interfaces.raftNodeUserDataToString(userData,&userDataString);
         str = sdscat(str,userDataString);
@@ -295,17 +473,29 @@ void loadConfigFromString(Raft* raftPtr,const sds str,int len){
             //机器已经在配置中
             if(isNodeInConfig(raftPtr,nodeId)){
                 i += offset;
+                RaftNode * node = getRaftNodeFromConfig(raftPtr,nodeId);
+                raftNodeSetActive(node,1);
+                if(!raftNodeHasCanVote(node)){
+                    raftNodeSetCanVote(node,1);
+                }
                 continue;
             }
             RaftNode * node = getRaftNodeFromConfig(raftPtr,nodeId);
             if(NULL != node){
                 //已经有此节点了
                 i += offset;
+                raftNodeSetActive(node,1);
+                if(!raftNodeHasCanVote(node)){
+                    raftNodeSetCanVote(node,1);
+                }
                 continue;
             }
             RaftNode* newNode = addRaftNodeIntoConfig(raftPtr,nodeId,userData,0);
             raftAssert(newNode!=NULL);
-
+            raftNodeSetActive(newNode,1);
+            if(!raftNodeHasCanVote(newNode)){
+                raftNodeSetCanVote(newNode,1);
+            }
             //leader要对新增的node的index，进行复位
             if(raftPtr->role == Leader){
                 //TODO:快照会不同
@@ -344,7 +534,6 @@ Raft* getNewRaft(){
     ptr->commitIndex = 0;
     ptr->lastApplied = 0;
     ptr->role = Follower;
-    ptr->voteMeCount = 0;
     
     //TODO:要细调节
     //
@@ -354,7 +543,7 @@ Raft* getNewRaft(){
     ptr->electionTimeout = ptr->electionTimeoutBegin + (int)((ptr->electionTimeoutEnd - ptr->electionTimeoutBegin) * ((float)rand()/(float)RAND_MAX));
     ptr->heartbeatTimeout = 15 * basetime;
 
-    ptr->maxEntryCountInOneAppendEntries = 5;
+    ptr->maxEntryCountInOneAppendEntries = 500;
     ptr->maxAppendEntriesSendInterval = ptr->heartbeatTimeout / 5;
 
     ptr->timeGone = 0;
@@ -365,7 +554,7 @@ Raft* getNewRaft(){
     ptr->selfNode = NULL;
 
     ptr->countOfLeaderCommittedEntriesInCurrentTerm = 0;
-    ptr->maxCountOfApplyingEntry = 5;
+    ptr->maxCountOfApplyingEntry = 500;
     ptr->pendingAddRemoveServerRequest = NULL;
     ptr->pendingAddRemoveServerPeer = NULL;
     return ptr;
@@ -402,28 +591,92 @@ void setRaftInterface(Raft* raftPtr,Interface* interfaces,UserDataInterfaceType 
     raftAssert(interfaces!=NULL);
     memcpy(&raftPtr->interfaces,interfaces,sizeof(Interface));
     raftPtr->userData = userData;
+    if(raftPtr->interfaces.applyEntry == NULL){
+        raftPtr->interfaces.applyEntry = defaultApplyLog;
+    }
+}
+
+void setRaftVotedFor(Raft* raftPtr,uint64_t vfor){
+    raftAssert(raftPtr!=NULL);
+    raftPtr->votedFor = vfor;
+
+    if(raftPtr->interfaces.persistState){
+        raftPtr->interfaces.persistState(raftPtr);
+    }    
+}
+
+uint64_t getRaftVotedFor(const Raft* raftPtr){
+    raftAssert(raftPtr!=NULL);
+    return raftPtr->votedFor;
+}
+
+void setRaftCurrentTerm(Raft* raftPtr,int t){
+    raftAssert(raftPtr!=NULL);
+
+    raftPtr->currentTerm = t;
+    if(raftPtr->interfaces.persistState){
+        raftPtr->interfaces.persistState(raftPtr);
+    }
+}
+
+int getRaftCurrentTerm(const Raft* raftPtr){
+    raftAssert(raftPtr!=NULL);
+    return raftPtr->currentTerm;
+}
+
+void setRaftCommitIndex(Raft* raftPtr,int ci){
+    raftAssert(raftPtr!=NULL);
+    raftPtr->commitIndex = ci;
+    if(raftPtr->interfaces.persistState){
+        raftPtr->interfaces.persistState(raftPtr);
+    }
+}
+
+int getRaftCommitIndex(const Raft* raftPtr){
+    raftAssert(raftPtr!=NULL);
+    return raftPtr->commitIndex;
 }
 
 void onConversionToFollower(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
     raftPtr->role = Follower;
-    raftPtr->votedFor = (uint64_t)-1;
+    setRaftVotedFor(raftPtr,(uint64_t)-1);
+    for(int i=0;i<raftPtr->nodeCount;++i){
+        RaftNode* node = raftPtr->nodeList[i];
+        //if(node->nodeId == raftPtr->nodeId){
+        //    continue;
+        //}
+        resetRaftNodeIndex(node,1,0);
+    }
     raftLog(RAFT_DEBUG,"onConversionToFollower");
 }
 
 void onConversionToCandidate(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
     raftPtr->role = Candidate;
-    raftPtr->currentTerm++;
+    setRaftCurrentTerm(raftPtr,getRaftCurrentTerm(raftPtr)+1);
+    for(int i=0;i<raftPtr->nodeCount;++i){
+        RaftNode* node = raftPtr->nodeList[i];
+        resetRaftNodeVote(node,0);
+        raftNodeSetVote(node,0);
+        //if(node->nodeId == raftPtr->nodeId){
+        //    continue;
+        //}
+        resetRaftNodeIndex(node,1,0);
+    }
     //如果此raft实例不在最新的配置中。就不能给自己投票
     //这种情况出现在RemoveServer中，Cold中但不在Cnew中的机器可以参与选举，
     //也能够被其它机器投票。但是不能给自己投票。自己不算入majority。
-    if(isNodeInConfig(raftPtr,raftPtr->nodeId)){
-        raftPtr->votedFor = raftPtr->nodeId;
-        raftPtr->voteMeCount = 1;
+    if(isNodeInConfig(raftPtr,raftPtr->nodeId) && 
+            raftNodeHasActive(raftPtr->selfNode) &&
+            raftNodeHasCanVote(raftPtr->selfNode)){
+        setRaftVotedFor(raftPtr,raftPtr->nodeId);
+        resetRaftNodeVote(raftPtr->selfNode,1);
+        raftNodeSetVote(raftPtr->selfNode,1);
     }else{
-        raftPtr->votedFor = -1;
-        raftPtr->voteMeCount = 0;
+        setRaftVotedFor(raftPtr,(uint64_t)-1);
+        resetRaftNodeVote(raftPtr->selfNode,0);
+        raftNodeSetVote(raftPtr->selfNode,0);
     }
     
     resetRaftTime(raftPtr);
@@ -431,7 +684,9 @@ void onConversionToCandidate(Raft* raftPtr){
     /*发送RequestVote请求给其它机器*/
     for(int i=0;i<raftPtr->nodeCount;++i){
         //不发给自己
-        if(raftPtr->nodeList[i]->nodeId == raftPtr->nodeId){
+        if(raftPtr->nodeList[i]->nodeId == raftPtr->nodeId ||
+                !raftNodeHasActive(raftPtr->nodeList[i]) ||
+                !raftNodeHasCanVote(raftPtr->nodeList[i])){
             continue;
         }
         int ret = sendRequestVote(raftPtr,raftPtr->nodeList[i]);
@@ -446,18 +701,23 @@ void onConversionToCandidate(Raft* raftPtr){
 void onConversionToLeader(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
     raftAssert(raftPtr->role != Leader);
+    if(raftPtr->interfaces.onConversionToLeaderBefore){
+        raftPtr->interfaces.onConversionToLeaderBefore(raftPtr);
+    }
     raftPtr->role = Leader;
     setRaftLeaderNode(raftPtr,raftPtr->selfNode);
     for(int i=0;i<raftPtr->nodeCount;++i){
         RaftNode* node = raftPtr->nodeList[i];
-        if(raftPtr->selfNode == node){
-            continue;
-        }
+        //if(raftPtr->selfNode == node){
+        //    continue;
+        //}
         resetRaftNodeIndex(node,logLength(raftPtr->log),logFirstLogIndex(raftPtr->log));
     }
     raftPtr->countOfLeaderCommittedEntriesInCurrentTerm = 0;
     logApppendNoop(raftPtr);
-
+    if(raftPtr->interfaces.onConversionToLeaderAfter){
+        raftPtr->interfaces.onConversionToLeaderAfter(raftPtr);
+    }
     //发送心跳包给其它机器
     sendHeartbeatsToOthers(raftPtr);
     raftLog(RAFT_DEBUG,"onConversionToLeader");
@@ -470,12 +730,46 @@ int isLeader(const Raft* raftPtr){
 
 int getMajorityVote(const Raft* raftPtr){
     raftAssert(raftPtr != NULL);
-    return raftPtr->voteMeCount > (raftPtr->nodeCount/2);
+    int count = 0;
+    for(int i=0;i<raftPtr->nodeCount;i++){
+        if(raftNodeHasActive(raftPtr->nodeList[i]) && 
+                raftNodeHasCanVote(raftPtr->nodeList[i]) && 
+                raftNodeHasVoted(raftPtr->nodeList[i])){
+            ++count;
+        }
+    }
+    
+    return beyondMajority(count,raftPtr);
+}
+
+int getMajority(const Raft* raftPtr){
+    raftAssert(raftPtr != NULL);
+    int count = 0;
+    for(int i=0;i<raftPtr->nodeCount;i++){
+        if(raftNodeHasActive(raftPtr->nodeList[i]) && 
+                raftNodeHasCanVote(raftPtr->nodeList[i])){
+            ++count;
+        }
+    }
+    return count;
 }
 
 int beyondMajority(int count,const Raft* raftPtr){
     raftAssert(raftPtr != NULL);
-    return count > (raftPtr->nodeCount/2);
+    int majority = getCountOfRaftNodeActiveAndCanVote(raftPtr);
+    return count > (majority / 2);
+}
+
+int getCountOfRaftNodeActiveAndCanVote(const Raft* raftPtr){
+    raftAssert(raftPtr != NULL);
+    int count = 0;
+    for(int i=0;i<raftPtr->nodeCount;i++){
+        if(raftNodeHasActive(raftPtr->nodeList[i]) && 
+                raftNodeHasCanVote(raftPtr->nodeList[i])){
+            ++count;
+        }
+    }
+    return count;
 }
 
 int myLogIsNewer(const Log* logPtr,const RequestVoteRequest* reqPtr){
@@ -489,28 +783,76 @@ int myLogIsNewer(const Log* logPtr,const RequestVoteRequest* reqPtr){
     return 0;
 }
 
-void applyLog(Raft* raftPtr){
+void applyLog(Raft* raftPtr,int appliedCount){
     raftAssert(raftPtr != NULL);
     //应用日志到状态机
     if(raftPtr->commitIndex > raftPtr->lastApplied){
-        int count = min(raftPtr->maxCountOfApplyingEntry,raftPtr->commitIndex - raftPtr->lastApplied);
+        int count = min(appliedCount,raftPtr->commitIndex - raftPtr->lastApplied);
         for(int i=0;i<count;++i){
             raftPtr->lastApplied++;
             Entry e = logAt(raftPtr->log,raftPtr->lastApplied);
-            if(e.type == NO_OP){
-                if(e.data == NULL){
-                    raftLog(RAFT_DEBUG,"raft %lu apply no_op index %d term %d cmd is null",raftPtr->nodeId,e.index,e.term);
-                }else{
-                    raftLog(RAFT_DEBUG,"raft %lu apply no_op index %d term %d cmd %s",raftPtr->nodeId,e.index,e.term,e.data);
-                }
-            }else if(e.type == CONFIG){
-                raftLog(RAFT_DEBUG,"raft %lu apply config index %d term %d cmd %s",raftPtr->nodeId,e.index,e.term,e.data);
-            }else{
-                raftLog(RAFT_DEBUG,"raft %lu apply data index %d term %d",raftPtr->nodeId,e.index,e.term);
+            if(raftPtr->interfaces.applyEntry){
+                raftPtr->interfaces.applyEntry(raftPtr,raftPtr->userData,&e);
             }
+
+            if(isConfigChangeEntry(e.type)){
+                //配置变更处理
+                uint64_t nodeId = -1;
+                raftPtr->interfaces.getConfigEntryNodeId(raftPtr,raftPtr->userData,&e,&nodeId);
+                RaftNode* node = getRaftNodeFromConfig(raftPtr,nodeId);
+                switch (e.type)
+                {
+                case ADD_NODE:
+                    {
+                        raftNodeSetAddCommitted(node,1);
+                    }
+                    break;
+                case ENABLE_VOTE:
+                    {
+                        raftNodeSetAddCommitted(node,1);
+                        raftNodeSetCanVoteCommitted(node,1);
+                    }
+                    break;
+                case DISABLE_VOTE:
+                    {
+                        if(node){
+                            raftNodeSetCanVoteCommitted(node,0);
+                        }
+                    }
+                    break;
+                case REMOVE_NODE:
+                    {
+                        if(node){
+                            //TODO:删除节点
+                            removeRaftNodeFromConfig(raftPtr,nodeId);
+                        }
+                    }
+                    break;
+                default:
+                    raftAssert(0);
+                    break;
+                }
+            }    
         }
         
     }
+}
+
+int defaultApplyLog(RaftInterfaceType raftPtr,UserDataInterfaceType raftUserData,Entry* entPtr){
+    raftAssert(raftPtr!=NULL);
+    raftAssert(entPtr!=NULL);
+    if(entPtr->type == NO_OP){
+        if(entPtr->data == NULL){
+            raftLog(RAFT_DEBUG,"raft %lu apply no_op index %d term %d cmd is null",raftPtr->nodeId,entPtr->index,entPtr->term);
+        }else{
+            raftLog(RAFT_DEBUG,"raft %lu apply no_op index %d term %d cmd %s",raftPtr->nodeId,entPtr->index,entPtr->term,entPtr->data);
+        }
+    }else if(entPtr->type == LOAD_CONFIG){
+        raftLog(RAFT_DEBUG,"raft %lu apply config index %d term %d cmd %s",raftPtr->nodeId,entPtr->index,entPtr->term,entPtr->data);
+    }else{
+        raftLog(RAFT_DEBUG,"raft %lu apply data index %d term %d",raftPtr->nodeId,entPtr->index,entPtr->term);
+    }
+    return 0;
 }
 
 int indexIsCommitted(Raft* raftPtr,int index){
@@ -526,7 +868,37 @@ int isLeaderCommittedEntriesInCurrentTerm(Raft* raftPtr){
 
 void raftCore(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
-    raftLog(RAFT_DEBUG,"raft %lu electTimeout %d timegone %d",raftPtr->nodeId,raftPtr->electionTimeout,raftPtr->timeGone);
+    const char* roleStr[3]={
+        "Follower",
+        "Candidate",
+        "Leader"
+    };
+    char votedForInfo[1024];
+    if(raftPtr->votedFor == ((uint64_t)-1)){
+        snprintf(votedForInfo,sizeof(votedForInfo),"-1");
+    }else{
+        snprintf(votedForInfo,sizeof(votedForInfo),"%lu",raftPtr->votedFor);
+    }
+    
+    raftLog(RAFT_DEBUG,
+        "%d (role %s) nodeCount %d term %d votedFor %s commitIndex %d lastApplied %d  \
+        lastLogIndex %d lastLogTerm %d lastConfigEntryIndex %d lastNoopEntryIndex %d \
+        timeGone %d election %d heartbeat %d",
+        raftPtr->nodeId,
+        roleStr[raftPtr->role],
+        raftPtr->nodeCount,
+        raftPtr->currentTerm,
+        votedForInfo,
+        raftPtr->commitIndex,
+        raftPtr->lastApplied,
+        logLastLogIndex(raftPtr->log),
+        logLastLogTerm(raftPtr->log),
+        getLastConfigEntryIndex(raftPtr->log),
+        getLastNoopEntryIndex(raftPtr->log),
+        getRaftTime(raftPtr),
+        raftPtr->electionTimeout,
+        raftPtr->heartbeatTimeout);
+    
     if(Leader == raftPtr->role){
         //发送hearbeat给peers
         if(raftPtr->timeGone >= raftPtr->heartbeatTimeout){
@@ -541,7 +913,17 @@ void raftCore(Raft* raftPtr){
         //Follower和Candidate要不同处理
         if(Follower == raftPtr->role){
             //TODO:conversion to candidate
-            onConversionToCandidate(raftPtr);
+            //如果能投票的节点数只有1个，并且自己能投票，就直接转为Leader
+            //如果能投票的节点数超过1，才转为候选人
+            if(getCountOfRaftNodeActiveAndCanVote(raftPtr) == 1 &&
+                    raftPtr->selfNode &&
+                    raftNodeHasCanVote(raftPtr->selfNode)){
+                onConversionToCandidate(raftPtr);
+            }else if(getCountOfRaftNodeActiveAndCanVote(raftPtr) > 1 &&
+                    raftPtr->selfNode &&
+                    raftNodeHasCanVote(raftPtr->selfNode)){
+                onConversionToCandidate(raftPtr);
+            }
         }else if(Candidate == raftPtr->role){
             //TODO:如果投票数不够majority，重新选举
             if(!getMajorityVote(raftPtr)){
@@ -553,9 +935,13 @@ void raftCore(Raft* raftPtr){
         }
     }
 
-    applyLog(raftPtr);
+    applyLog(raftPtr,raftPtr->maxCountOfApplyingEntry);
 
     checkInvariants(raftPtr);
+}
+
+int matchIndexCompare(const void* A,const void *B){
+    return (*(int*)A) - (*(int*)B);
 }
 
 void basicInvariants(const Raft* raftPtr){
@@ -579,6 +965,40 @@ void basicInvariants(const Raft* raftPtr){
     expect(raftPtr->lastApplied <= raftPtr->commitIndex);
     //lastLogIndex is either just below the log start(for empty logs) or larger (for non-empty logs)
     expect(logLastLogIndex(raftPtr->log) >= logFirstLogIndex(raftPtr->log) - 1);
+    //leader's commitIndex is always >=  matchIndex in the majority.
+    if(isLeader(raftPtr)){
+        int* array = raftCalloc(raftPtr->nodeCount,sizeof(int));
+        int count = 0;
+        for(int i=0;i<raftPtr->nodeCount;++i){
+            if(!raftNodeHasActive(raftPtr->nodeList[i]) ||
+                    !raftNodeHasCanVote(raftPtr->nodeList[i])){
+                continue;
+            }
+            ++count;
+            array[i] = raftPtr->nodeList[i]->matchIndex;
+        }
+        if(count == 0){
+            raftFree(array);
+        }else{
+            qsort(array,count,sizeof(int),matchIndexCompare);
+            int index = (count - 1)/2;
+            raftAssert(index >= 0 && index < count);
+            int matchIndexInMajority = array[index];
+            raftFree(array);
+            expect(raftPtr->commitIndex >= matchIndexInMajority ||
+                logAt(raftPtr->log,matchIndexInMajority).term != raftPtr->currentTerm);
+        }
+    }
+
+    //a leader always points its leaderId at itself.
+    if(isLeader(raftPtr)){
+        expect(raftPtr->leaderNode == raftPtr->selfNode);
+    }
+
+    //a leader always voted for itself.(Candidates can vote for others when they abort an election.)
+    if(isLeader(raftPtr)){
+        expect(raftPtr->nodeId == raftPtr->votedFor);
+    }
 
 }
 
@@ -587,7 +1007,19 @@ void raftNodeBasicInvariants(const Raft* raftPtr){
     for(int i=0;i<raftPtr->nodeCount;i++){
         const RaftNode* node = raftPtr->nodeList[i];
         expect(node->matchIndex <= logLastLogIndex(raftPtr->log));
-        expect(node->matchIndex <= node->nextIndex);
+        if(node->nodeId == raftPtr->nodeId) {
+            continue;
+        }
+        //某些延迟的AppendEntries Response，会导致nextIndex小于matchIndex。
+        //但这不会造成问题，无非是已经匹配的Entry，再重新发送一遍。
+        //Raft论文也没要求matchIndex <= nextIndex，一定成立。
+        //expect(node->matchIndex <= node->nextIndex);
+        //if(isLeader(raftPtr)){
+            //majority 满足这个条件。但不一定是所有的node都满足这个条件
+            //expect(raftPtr->commitIndex <= node->matchIndex);
+            //在之前term中提交的日志，也会保留下来。这个条件不一定满足。
+            //expect(raftPtr->currentTerm == logAt(raftPtr->log,raftPtr->commitIndex).term);
+        //}
     }
 }
 
@@ -605,6 +1037,9 @@ RaftNode* getNewNode(uint64_t nodeId,void* userData){
     nodePtr->appendEntriesSendTime = 0;
     nodePtr->nodeId = nodeId;
     nodePtr->userData = userData;
+    nodePtr->isVote = 0;
+    /*一创建就有投票权*/
+    nodePtr->status = RAFT_NODE_CAN_VOTE;
     return nodePtr;
 }
 
@@ -628,6 +1063,83 @@ void resetRaftNodeIndex(RaftNode* nodePtr,int nextIndex,int matchIndex){
     nodePtr->matchIndex = matchIndex;
 }
 
+void raftNodeSetVote(RaftNode* nodePtr,int vote){
+    raftAssert(nodePtr!=NULL);
+    if(vote){
+        nodePtr->status |= RAFT_NODE_VOTED;
+    }else{
+        nodePtr->status &= ~RAFT_NODE_VOTED;
+    }
+}
+
+void resetRaftNodeVote(RaftNode* nodePtr,int vote){
+    raftAssert(nodePtr!=NULL);
+    nodePtr->isVote = vote;
+}
+
+int raftNodeHasVoted(RaftNode* nodePtr){
+    raftAssert(nodePtr!=NULL);
+    return nodePtr->status & RAFT_NODE_VOTED;
+}
+
+void raftNodeSetCanVote(RaftNode* nodePtr,int canVote){
+    raftAssert(nodePtr!=NULL);
+    if(canVote){
+        raftAssert(!raftNodeHasCanVote(nodePtr));
+        nodePtr->status |= RAFT_NODE_CAN_VOTE;
+    }else{
+        raftAssert(raftNodeHasCanVote(nodePtr));
+        nodePtr->status &= ~RAFT_NODE_CAN_VOTE;
+    }
+}
+
+int raftNodeHasCanVote(RaftNode* nodePtr){
+    raftAssert(nodePtr!=NULL);
+    return nodePtr->status & RAFT_NODE_CAN_VOTE;
+}
+
+void raftNodeSetActive(RaftNode* nodePtr,int active){
+    raftAssert(nodePtr!=NULL);
+    if(active){
+        nodePtr->status |= RAFT_NODE_ACTIVE;
+    }else{
+        nodePtr->status &= ~RAFT_NODE_ACTIVE;
+    }
+}
+
+int raftNodeHasActive(RaftNode* nodePtr){
+    raftAssert(nodePtr!=NULL);
+    return nodePtr->status & RAFT_NODE_ACTIVE;
+}
+
+void raftNodeSetCanVoteCommitted(RaftNode* nodePtr,int vote){
+    raftAssert(nodePtr!=NULL);
+    if(vote){
+        nodePtr->status |= RAFT_NODE_CAN_VOTE_COMMITTED;
+    }else{
+        nodePtr->status &= ~RAFT_NODE_CAN_VOTE_COMMITTED;
+    }
+}
+
+int raftNodeHasCanVoteCommitted(RaftNode* nodePtr){
+    raftAssert(nodePtr!=NULL);
+    return nodePtr->status & RAFT_NODE_CAN_VOTE_COMMITTED;
+}
+
+void raftNodeSetAddCommitted(RaftNode* nodePtr,int add){
+    raftAssert(nodePtr!=NULL);
+    if(add){
+        nodePtr->status |= RAFT_NODE_ADD_COMMITTED;
+    }else{
+        nodePtr->status &= ~RAFT_NODE_ADD_COMMITTED;
+    }
+}
+
+int raftNodeHasAddCommitted(RaftNode* nodePtr){
+    raftAssert(nodePtr!=NULL);
+    return nodePtr->status & RAFT_NODE_ADD_COMMITTED;
+}
+
 void showRaftNode(const RaftNode* nodePtr){
     raftAssert(nodePtr!=NULL);
     raftLog(RAFT_DEBUG,"nodeId:%lu matchIndex:%d nextIndex:%d",
@@ -646,6 +1158,9 @@ RaftNode* addRaftNodeIntoConfig(Raft* raftPtr,uint64_t nodeId,void* userData,int
     RaftNode* node = getRaftNodeFromConfig(raftPtr,nodeId);
     if(node){
         //已经有此机器了
+        if(!raftNodeHasCanVote(node)){
+            raftNodeSetCanVote(node,1);
+        }
         return node;
     }
     raftPtr->nodeCount++;
@@ -660,7 +1175,17 @@ RaftNode* addRaftNodeIntoConfig(Raft* raftPtr,uint64_t nodeId,void* userData,int
     }
     //对新增的node的index，进行复位
     resetRaftNodeIndex(raftPtr->nodeList[raftPtr->nodeCount - 1],1,0);
+    //通知配置变更事件
+    if(raftPtr->interfaces.membershipChangeEvent){
+        raftPtr->interfaces.membershipChangeEvent(raftPtr,raftPtr->nodeList[raftPtr->nodeCount - 1],NULL,(UserDataInterfaceType)1);
+    }
     return raftPtr->nodeList[raftPtr->nodeCount - 1];
+}
+
+RaftNode* addRaftNodeIntoConfigWithoutCanVote(Raft* raftPtr,uint64_t nodeId,void* userData,int me){
+    RaftNode* node = addRaftNodeIntoConfig(raftPtr,nodeId,userData,me);
+    raftAssert(node!=NULL);
+    raftNodeSetCanVote(node,0);
 }
 
 void removeRaftNodeFromConfig(Raft* raftPtr,uint64_t nodeId){
@@ -673,6 +1198,10 @@ void removeRaftNodeFromConfig(Raft* raftPtr,uint64_t nodeId){
                 RaftNode* t = raftPtr->nodeList[raftPtr->nodeCount-1];
                 raftPtr->nodeList[raftPtr->nodeCount-1] = raftPtr->nodeList[i];
                 raftPtr->nodeList[i] = t;
+            }
+            //通知配置变更事件
+            if(raftPtr->interfaces.membershipChangeEvent){
+                raftPtr->interfaces.membershipChangeEvent(raftPtr,raftPtr->nodeList[ raftPtr->nodeCount - 1 ],NULL,(UserDataInterfaceType)0);
             }
             //从尾部删除节点
             deleteRaftNode(raftPtr->nodeList[ raftPtr->nodeCount - 1 ]);
@@ -731,12 +1260,12 @@ int getAppendEntriesRequestLength(const AppendEntriesRequest* reqPtr){
 
 int followerRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestVoteRequest* reqPtr,RequestVoteResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     respPtr->requestTerm = reqPtr->term;
     if(reqPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(reqPtr->term < raftPtr->currentTerm){
@@ -747,7 +1276,7 @@ int followerRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestV
         respPtr->term = raftPtr->currentTerm;
         if((raftPtr->votedFor == (uint64_t)-1 || raftPtr->votedFor == reqPtr->candidateId) && !myLogIsNewer(raftPtr->log,reqPtr)){
             respPtr->voteGranted = 1;
-            raftPtr->votedFor = reqPtr->candidateId;
+            setRaftVotedFor(raftPtr,reqPtr->candidateId);
             //TODO:再次确认
             resetRaftTime(raftPtr);
             raftLog(RAFT_DEBUG,"follower(term %d lastLogTerm %d loglen %d) vote node %lu (term %d lastLogTerm %d loglen %d)",
@@ -764,12 +1293,12 @@ int followerRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestV
 }
 int candidateRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestVoteRequest* reqPtr,RequestVoteResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     respPtr->requestTerm = reqPtr->term;
     if(reqPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(reqPtr->term < raftPtr->currentTerm){
@@ -780,7 +1309,7 @@ int candidateRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const Request
         respPtr->term = raftPtr->currentTerm;
         if((raftPtr->votedFor == (uint64_t)-1 || raftPtr->votedFor == reqPtr->candidateId) && !myLogIsNewer(raftPtr->log,reqPtr)){
             respPtr->voteGranted = 1;
-            raftPtr->votedFor = reqPtr->candidateId;
+            setRaftVotedFor(raftPtr,reqPtr->candidateId);
             //TODO:再次确认
             resetRaftTime(raftPtr);
             raftLog(RAFT_DEBUG,"candidate(term %d loglen %d) vote node %lu (term %d loglen %d)",
@@ -796,12 +1325,12 @@ int candidateRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const Request
 }
 int leaderRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestVoteRequest* reqPtr,RequestVoteResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     respPtr->requestTerm = reqPtr->term;
     if(reqPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(reqPtr->term < raftPtr->currentTerm){
@@ -812,7 +1341,7 @@ int leaderRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestVot
         respPtr->term = raftPtr->currentTerm;
         if((raftPtr->votedFor == (uint64_t)-1 || raftPtr->votedFor == reqPtr->candidateId) && !myLogIsNewer(raftPtr->log,reqPtr)){
             respPtr->voteGranted = 1;
-            raftPtr->votedFor = reqPtr->candidateId;
+            setRaftVotedFor(raftPtr,reqPtr->candidateId);
             //TODO:再次确认
             resetRaftTime(raftPtr);
             raftLog(RAFT_DEBUG,"leader(term %d loglen %d) vote node %lu (term %d loglen %d)",
@@ -829,9 +1358,18 @@ int leaderRecvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestVot
 
 int recvRequestVote(Raft* raftPtr,const RaftNode* nodePtr,const RequestVoteRequest* reqPtr,RequestVoteResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
+    //本Raft实例没有投票权就不投票
+    /*
+    if(raftPtr->selfNode && !raftNodeHasCanVote(raftPtr->selfNode)){
+        respPtr->requestTerm = reqPtr->term;
+        respPtr->voteGranted = 0;
+        respPtr->term = raftPtr->currentTerm;
+        return 0;
+    }
+    */
     while(1){
         if(raftPtr->role == Follower){
             int again = followerRecvRequestVote(raftPtr,nodePtr,reqPtr,respPtr);
@@ -865,7 +1403,7 @@ int followerRecvRequestVoteResponse(Raft* raftPtr,const RaftNode* nodePtr,const 
     if(respPtr->requestTerm != raftPtr->currentTerm){
         return 0;
     }else if(respPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = respPtr->term;
+        setRaftCurrentTerm(raftPtr,respPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(respPtr->term < raftPtr->currentTerm){
@@ -886,7 +1424,7 @@ int candidateRecvRequestVoteResponse(Raft* raftPtr,const RaftNode* nodePtr,const
     if(respPtr->requestTerm != raftPtr->currentTerm){
         return 0;
     }else if(respPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = respPtr->term;
+        setRaftCurrentTerm(raftPtr,respPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(respPtr->term < raftPtr->currentTerm){
@@ -902,7 +1440,9 @@ int candidateRecvRequestVoteResponse(Raft* raftPtr,const RaftNode* nodePtr,const
        {
            if(respPtr->voteGranted){
                //增加投票数
-               raftPtr->voteMeCount++;
+               //TOFIX:投票的RPC被重传时，会出现同一个peer投票多次的情况。
+               resetRaftNodeVote((RaftNode*)nodePtr,1);
+               raftNodeSetVote((RaftNode*)nodePtr,1);
            }
        }
     }
@@ -923,7 +1463,7 @@ int leaderRecvRequestVoteResponse(Raft* raftPtr,const RaftNode* nodePtr,const Re
     if(respPtr->requestTerm != raftPtr->currentTerm){
         return 0;
     }else if(respPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = respPtr->term;
+        setRaftCurrentTerm(raftPtr,respPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(respPtr->term < raftPtr->currentTerm){
@@ -967,14 +1507,14 @@ int recvRequestVoteResponse(Raft* raftPtr,const RaftNode* nodePtr,const RequestV
 
 int followerRecvAppendEntriesRequest(Raft* raftPtr,RaftNode* nodePtr,const AppendEntriesRequest* reqPtr,AppendEntriesResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     respPtr->requestTerm = reqPtr->term;
     respPtr->prevLogIndex = reqPtr->prevLogIndex;
     respPtr->entryCount = reqPtr->entryCount;
     if(reqPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         resetRaftTime(raftPtr);
         return 1;
@@ -1013,7 +1553,7 @@ int followerRecvAppendEntriesRequest(Raft* raftPtr,RaftNode* nodePtr,const Appen
                 //有冲突Entry
                 //删除冲突及其之后的全部Entry
                 int delCnt = logLength(raftPtr->log) - newIndex;
-                logDeleteAtEnd(raftPtr->log,delCnt);
+                logDeleteAtEnd(raftPtr,delCnt);
                 //拼接上leader的Entry
                 for(int index = newIndex - offset;index < reqPtr->entryCount;++index){
                     logAppend(raftPtr,reqPtr->entries[index]);
@@ -1033,7 +1573,8 @@ int followerRecvAppendEntriesRequest(Raft* raftPtr,RaftNode* nodePtr,const Appen
 
             if(reqPtr->leaderCommit > raftPtr->commitIndex){
                 int nextCommitIndex = min(reqPtr->leaderCommit,indexOfLastNewEntry);
-                raftPtr->commitIndex = max(raftPtr->commitIndex,nextCommitIndex);
+                setRaftCommitIndex(raftPtr,max(raftPtr->commitIndex,nextCommitIndex));
+                raftAssert(raftPtr->commitIndex == logAt(raftPtr->log,raftPtr->commitIndex).index);
             }
 
             respPtr->success = 1;
@@ -1069,7 +1610,7 @@ int followerRecvAppendEntriesRequest(Raft* raftPtr,RaftNode* nodePtr,const Appen
                 //有冲突Entry
                 //删除冲突及其之后的全部entry
                 int delCnt = logLength(raftPtr->log) - newIndex;
-                logDeleteAtEnd(raftPtr->log,delCnt);
+                logDeleteAtEnd(raftPtr,delCnt);
                 //拼接上leader的日志
                 for(int index = newIndex - offset;index < reqPtr->entryCount;index++){
                     logAppend(raftPtr,reqPtr->entries[index]);
@@ -1088,26 +1629,27 @@ int followerRecvAppendEntriesRequest(Raft* raftPtr,RaftNode* nodePtr,const Appen
 
             if(reqPtr->leaderCommit > raftPtr->commitIndex){
                 int nextCommitIndex = min(reqPtr->leaderCommit,indexOfLastNewEntry);
-                raftPtr->commitIndex = max(raftPtr->commitIndex,nextCommitIndex);
+                setRaftCommitIndex(raftPtr,max(raftPtr->commitIndex,nextCommitIndex));
+                raftAssert(raftPtr->commitIndex == logAt(raftPtr->log,raftPtr->commitIndex).index);
             }
             respPtr->success = 1;
         }
     }
 
-    setRaftLeaderNode(raftPtr,nodePtr);
+    //setRaftLeaderNode(raftPtr,nodePtr);
     return 0;
 }
 
 int candidateRecvAppendEntriesRequest(Raft* raftPtr,const RaftNode* nodePtr,const AppendEntriesRequest* reqPtr,AppendEntriesResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     respPtr->requestTerm = reqPtr->term;
     respPtr->prevLogIndex = reqPtr->prevLogIndex;
     respPtr->entryCount = reqPtr->entryCount;
     if(reqPtr->term >= raftPtr->currentTerm){
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         resetRaftTime(raftPtr);
         return 1;
@@ -1122,14 +1664,14 @@ int candidateRecvAppendEntriesRequest(Raft* raftPtr,const RaftNode* nodePtr,cons
 
 int leaderRecvAppendEntriesRequest(Raft* raftPtr,const RaftNode* nodePtr,const AppendEntriesRequest* reqPtr,AppendEntriesResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     respPtr->requestTerm = reqPtr->term;
     respPtr->prevLogIndex = reqPtr->prevLogIndex;
     respPtr->entryCount = reqPtr->entryCount;
     if(reqPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         resetRaftTime(raftPtr);
         return 1;
@@ -1137,7 +1679,7 @@ int leaderRecvAppendEntriesRequest(Raft* raftPtr,const RaftNode* nodePtr,const A
         respPtr->term = raftPtr->currentTerm;
         respPtr->success = 0;
     }else{
-        raftPtr->currentTerm = reqPtr->term;
+        setRaftCurrentTerm(raftPtr,reqPtr->term);
         onConversionToFollower(raftPtr);
         resetRaftTime(raftPtr);
         return 1;
@@ -1147,7 +1689,7 @@ int leaderRecvAppendEntriesRequest(Raft* raftPtr,const RaftNode* nodePtr,const A
 
 int recvAppendEntriesRequest(Raft* raftPtr,const RaftNode* nodePtr,const AppendEntriesRequest* reqPtr,AppendEntriesResponse* respPtr){
     raftAssert(raftPtr != NULL);
-    raftAssert(nodePtr != NULL);
+    //raftAssert(nodePtr != NULL);
     raftAssert(reqPtr != NULL);
     raftAssert(respPtr!=NULL);
     while(1){
@@ -1200,7 +1742,9 @@ int sendAppendEntries(Raft* raftPtr,RaftNode* nodePtr,int entryCount){
             for(int j=nodePtr->nextIndex;j < length;++j){
                 req.entries[j - nodePtr->nextIndex] = logAt(raftPtr->log,j);
                 //TEST
-                raftAssert(logAt(raftPtr->log,j).data != NULL && logAt(raftPtr->log,j).dataLen != 0);
+                if(!isVoteRightConfigChangeEntry(logAt(raftPtr->log,j).type)){
+                    raftAssert(logAt(raftPtr->log,j).data != NULL && logAt(raftPtr->log,j).dataLen != 0);
+                }
             }
             req.entryCount = count;
         }else{
@@ -1224,7 +1768,8 @@ int sendHeartbeatsToOthers(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
     raftAssert(raftPtr->role == Leader);
     for(int i=0;i<raftPtr->nodeCount;++i){
-        if(raftPtr->selfNode == raftPtr->nodeList[i]){
+        if(raftPtr->selfNode == raftPtr->nodeList[i] || 
+                !raftNodeHasActive(raftPtr->nodeList[i])){
             continue;
         }
         if(raftPtr->nodeList[i]->nextIndex <= logLastIncludedIndex(raftPtr->log)){
@@ -1242,7 +1787,8 @@ int sendAppendEntriesToOthersIfNeed(Raft* raftPtr){
     raftAssert(raftPtr != NULL);
     raftAssert(raftPtr->role == Leader);
     for(int i=0;i<raftPtr->nodeCount;++i){
-        if(raftPtr->selfNode == raftPtr->nodeList[i]){
+        if(raftPtr->selfNode == raftPtr->nodeList[i] || 
+                !raftNodeHasActive(raftPtr->nodeList[i])){
             continue;
         }
         if(raftPtr->nodeList[i]->nextIndex <= logLastIncludedIndex(raftPtr->log)){
@@ -1270,11 +1816,15 @@ void leaderUpdateCommitIndex(Raft* raftPtr){
         //这种情况出现在RemoveServer中，leader在Cold中但不在Cnew中，可以参与选举，
         //也能够被其它机器投票。可以复制日志给其它机器。
         //但是不能给自己投票。自己不算入majority。
-        if(isNodeInConfig(raftPtr,raftPtr->nodeId)){
+        if(isNodeInConfig(raftPtr,raftPtr->nodeId) && 
+            raftNodeHasActive(raftPtr->selfNode) &&
+            raftNodeHasCanVote(raftPtr->selfNode)){
             cnt = 1;
         }
         for(int i=0;i<raftPtr->nodeCount;i++){
-            if(raftPtr->nodeList[i] == raftPtr->selfNode){
+            if(raftPtr->nodeList[i] == raftPtr->selfNode ||
+                    !raftNodeHasActive(raftPtr->nodeList[i]) ||
+                    !raftNodeHasCanVote(raftPtr->nodeList[i])){
                 continue;
             }
             if(raftPtr->nodeList[i]->matchIndex >= N){
@@ -1282,10 +1832,12 @@ void leaderUpdateCommitIndex(Raft* raftPtr){
             }
         }
         if(beyondMajority(cnt,raftPtr)){
-            raftPtr->commitIndex = N;
+            setRaftCommitIndex(raftPtr,N);
             raftPtr->countOfLeaderCommittedEntriesInCurrentTerm++;
         }
     }
+
+    raftAssert(raftPtr->commitIndex == logAt(raftPtr->log,raftPtr->commitIndex).index);
 
     if(indexIsCommitted(raftPtr,getLastConfigEntryIndex(raftPtr->log))){
         //看是否有关联的pending的AddRemoveServer请求
@@ -1300,7 +1852,7 @@ int followerRecvAppendEntriesResponse(Raft* raftPtr,const RaftNode* nodePtr,cons
     if(respPtr->requestTerm != raftPtr->currentTerm){
         return 0;
     }else if(respPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = respPtr->term;
+        setRaftCurrentTerm(raftPtr,respPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(respPtr->term < raftPtr->currentTerm){
@@ -1319,7 +1871,7 @@ int candidateRecvAppendEntriesResponse(Raft* raftPtr,const RaftNode* nodePtr,con
     if(respPtr->requestTerm != raftPtr->currentTerm){
         return 0;
     }else if(respPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = respPtr->term;
+        setRaftCurrentTerm(raftPtr,respPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(respPtr->term < raftPtr->currentTerm){
@@ -1338,7 +1890,7 @@ int leaderRecvAppendEntriesResponse(Raft* raftPtr,RaftNode* nodePtr,const Append
     if(respPtr->requestTerm != raftPtr->currentTerm){
         return 0;
     }else if(respPtr->term > raftPtr->currentTerm){
-        raftPtr->currentTerm = respPtr->term;
+        setRaftCurrentTerm(raftPtr,respPtr->term);
         onConversionToFollower(raftPtr);
         return 1;
     }else if(respPtr->term < raftPtr->currentTerm){
@@ -1353,7 +1905,7 @@ int leaderRecvAppendEntriesResponse(Raft* raftPtr,RaftNode* nodePtr,const Append
         nodePtr->matchIndex = next;
         nodePtr->nextIndex = max(nodePtr->matchIndex+1,nodePtr->nextIndex);
     }else{
-        //收到肯定答复。减少（可能不变，拒绝增加）机器的matchIndex和nextIndex。
+        //收到否定答复。减少（可能不变，拒绝增加）机器的matchIndex和nextIndex。
         int next = nodePtr->nextIndex;
         if(respPtr->conflictTerm != -1){
             //有冲突的term
@@ -1413,13 +1965,18 @@ int recvAppendEntriesResponse(Raft* raftPtr,RaftNode* nodePtr,const AppendEntrie
 
 int submitDataToRaft(Raft* raftPtr,sds data,int dataLen,enum EntryType type,int* index,int* term){
     raftAssert(raftPtr!=NULL);
-    if(CONFIG != type){
-        if(!isLeader(raftPtr)){
-            raftLog(RAFT_WARNING,"not leader. don't receiver data");
-            return -1;
-        }
+    
+    if(type != LOAD_CONFIG && !isLeader(raftPtr)){
+        raftLog(RAFT_WARNING,"not leader. don't receiver data");
+        return NOT_LEADER;
     }
 
+    if(isVoteRightConfigChangeEntry(type)){
+        if(!indexIsCommitted(raftPtr,getLastConfigEntryIndex(raftPtr->log))){
+            return WAIT_PREVIOUS_CONFIG_COMMITTED;
+        }
+    }
+    
     int logIndex = logAppendData(raftPtr,data,dataLen,type);
     if(index){
         *index = logIndex;
@@ -1466,13 +2023,51 @@ int addServer(Raft* raftPtr,uint64_t nodeId,UserDataInterfaceType userData){
     return 0;
 }
 
+int addServerRPC(Raft* raftPtr,uint64_t nodeId,UserDataInterfaceType userData){
+    raftAssert(raftPtr!=NULL);
+    raftAssert(nodeId!=((uint64_t)-1));
+    if(!isLeader(raftPtr)){
+        return NOT_LEADER;
+    }
+
+    if(isNodeInConfig(raftPtr,nodeId)){
+        return SERVER_IN_CONFIG_ALREADY;
+    }
+
+    //TODO:catch up new server
+    //之前的配置修改还没commit
+    if(!indexIsCommitted(raftPtr,getLastConfigEntryIndex(raftPtr->log))){
+        return WAIT_PREVIOUS_CONFIG_COMMITTED;
+    }
+    //如果leader在currentTerm中没有commit过任何entry。先commit一个entry后
+    //才能再更新机器配置
+    if(!isLeaderCommittedEntriesInCurrentTerm(raftPtr)){
+        logApppendNoop(raftPtr);
+        return WAIT_NO_OP_ENTRY_COMMITTED_IN_COLD;
+    }
+    //之前的配置修改已committed，并且没有关联的pending请求
+    //Append Cnew into log
+    sds cnew=makeConfigStringWith(raftPtr,nodeId,NULL);
+    logAppendData(raftPtr,cnew,sdslen(cnew),LOAD_CONFIG);
+    sdsfree(cnew);
+    //Cnew还没commit
+    if(!indexIsCommitted(raftPtr,getLastConfigEntryIndex(raftPtr->log))){
+        //TODO:关联到pending请求中
+        //等到日志被commit时，再答复
+        //node可能是NULL。但是Peer一定不是NULL
+        raftPtr->pendingAddRemoveServerPeer = userData;
+        return 0;
+    }
+    return 0;
+}
+
 int recvAddRemoveServerRequest(Raft* raftPtr,UserDataInterfaceType userData,
         const AddRemoveServerRequest* reqPtr,AddRemoveServerResponse* respPtr){
     raftAssert(raftPtr!=NULL);
     raftAssert(userData!=NULL);
     raftAssert(reqPtr!=NULL);
     raftAssert(respPtr!=NULL);
-        if(raftPtr->role != Leader){
+    if(raftPtr->role != Leader){
         respPtr->status = NOT_LEADER;
         return 1;
     }
@@ -1525,13 +2120,13 @@ int recvAddRemoveServerRequest(Raft* raftPtr,UserDataInterfaceType userData,
             //讲机器字符串数组转为userData
             raftPtr->interfaces.raftNodeStringToUserData(lines,count,&addr);
             sds cnew=makeConfigStringWith(raftPtr,nodeId,addr);
-            logAppendData(raftPtr,cnew,sdslen(cnew),CONFIG);
+            logAppendData(raftPtr,cnew,sdslen(cnew),LOAD_CONFIG);
             sdsfree(cnew);
             raftFree(addr);
             sdsfreesplitres(lines,count);
         }else if(reqPtr->method == REMOVE){
             sds cnew=makeConfigStringWithout(raftPtr,nodeId);
-            logAppendData(raftPtr,cnew,sdslen(cnew),CONFIG);
+            logAppendData(raftPtr,cnew,sdslen(cnew),LOAD_CONFIG);
             sdsfree(cnew);
         }
 
@@ -1580,8 +2175,8 @@ int min(int a,int b){
 }
 
 void raftLog(int level,const char* fmt,...){
-    if(level){
-        level += 0;
+    if(level < raftLogLevel){
+        return;
     }
     char buffer[4096];
     va_list args;
@@ -1596,5 +2191,5 @@ void raftPanic(const char* fmt,...){
     va_start(args,fmt);
     vsnprintf(buffer,sizeof(buffer),fmt,args);
     fprintf(stderr,"%s\n",buffer);
-    assert(0);
+    raftAssert(0);
 }
